@@ -13,9 +13,12 @@
 #include "NTP_time.h"
 #include "GPS_time.h"
 #include "RTC_time.h"
+#include <SPIFFS.h>
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <inttypes.h>
 
 #include "ArduinoNvs.h"
 #include "Button2.h"
@@ -25,11 +28,51 @@
 #include <melody_factory.h>
 #endif
 
+#include <ArduinoJson.h> //https://github.com/bblanchon/ArduinoJson
+
 #if PLAY_SOUNDS
 // audio
 String melodyFilePath = "/pokemon.rtttl";
 MelodyPlayer player(BUZZER_PIN);
 #endif
+
+class IntParameter : public WiFiManagerParameter
+{
+public:
+  IntParameter(const char *id, const char *placeholder, int value, const uint8_t length = 10)
+      : WiFiManagerParameter("")
+  {
+    init(id, placeholder, String(value).c_str(), length, "", WFM_LABEL_BEFORE);
+  }
+
+  /*
+    IntParameter(const char *id, const char *placeholder, int value, const uint8_t length, const char *custom)
+        : WiFiManagerParameter("")
+    {
+      init(id, placeholder, String(value).c_str(), length, custom, WFM_LABEL_BEFORE);
+    }
+  */
+  IntParameter(const char *custom)
+      : WiFiManagerParameter("")
+  {
+    // void WiFiManagerParameter::init(const char *id, const char *label, const char *defaultValue, int length, const char *custom, int labelPlacement)
+    init(NULL, NULL, nullptr, 1, custom, WFM_LABEL_DEFAULT);
+  }
+
+  long getValue()
+  {
+    return String(WiFiManagerParameter::getValue()).toInt();
+  }
+
+  void setValue(int value)
+  {
+
+    String mStr = String(value);
+    WiFiManagerParameter::setValue(mStr.c_str(), mStr.length());
+  }
+};
+
+const char *is_always_on_radio_str = "<br/><label for='param_always_on'>Clock always on</label><br/><input type='radio' name='param_always_on' value='1'>Yes<br/><input type='radio' name='param_always_on' value='0'>No<br/>";
 
 // Logging
 static const char *TAG = "main";
@@ -39,7 +82,16 @@ SPINixieInterface NIXIE_Interface;
 
 // Instantiate the WifiManager object
 WiFiManager wifiManager;
+// define your default values here, if there are different values in config.json, they are overwritten.
 
+int getRadioBoxValue(String name)
+{
+  if (wifiManager.server->hasArg(name))
+  {
+    return String(wifiManager.server->arg(name)).toInt();
+  }
+  return -1;
+}
 RTC *rtcTime;
 
 // ***************************************************************
@@ -57,8 +109,18 @@ boolean showingTime = false;
 boolean showingOffset = false;
 boolean showingDate = false;
 boolean factoryReset = false;
-int32_t time_offset;
+
 bool alreadyOff = false;
+
+int time_offset = DEFAULT_TIME_OFFSET;
+int clockOffHourFrom = CLOCK_OFF_FROM_HOUR;
+int clockOffHourTo = CLOCK_OFF_TO_HOUR;
+int alwaysOn = ALWAYS_ON;
+
+IntParameter param_time_offset_int("param_time_offset_int", "Time Offset", time_offset);
+IntParameter param_clock_off_hour_from("param_clock_off_hour_from", "Off Time - Start (Hour)", clockOffHourFrom);
+IntParameter param_clock_off_hour_to("param_clock_off_hour_to", "Off Time - Stop (Hour)", clockOffHourTo);
+IntParameter param_always_on(is_always_on_radio_str);
 
 boolean firstConnection = false;
 Button2 buttonMode, buttonUp, buttonDown;
@@ -75,17 +137,50 @@ time_t lastRunWifiCheck;
 long modeStart = 0.0;
 bool modeStarted = false;
 
-bool resNVS; // NVS Result
-
-void write_time_offset()
+void write_time_offset_NVS()
 {
-  resNVS = NVS.setInt("time_offset", time_offset + 500, 1);
+  NVS.setInt("time_offset", time_offset + 500, 0);
+  NVS.commit();
+  param_time_offset_int.setValue(time_offset);
 }
 
-boolean isHourInRange(int a, int b, int c) {
-  if (b > c) { // if the range spans midnight
+void write_all_settings_NVS()
+{
+  NVS.setInt("time_offset", time_offset + 500, 0);
+  NVS.setInt("off_hour_from", clockOffHourFrom + 500, 0);
+  NVS.setInt("off_hour_to", clockOffHourTo + 500, 0);
+  NVS.setInt("always_on", alwaysOn + 500, 0);
+  NVS.commit();
+}
+
+String getParam(String name)
+{
+  // read parameter from server, for customhmtl input
+  String value;
+  if (wifiManager.server->hasArg(name))
+  {
+    value = wifiManager.server->arg(name);
+  }
+  return value;
+}
+void saveParamCallback()
+{
+  time_offset = param_time_offset_int.getValue();
+  clockOffHourFrom = param_clock_off_hour_from.getValue();
+  clockOffHourTo = param_clock_off_hour_to.getValue();
+  alwaysOn = getRadioBoxValue("param_always_on");
+
+  write_all_settings_NVS();
+}
+
+boolean isHourInRange(int a, int b, int c)
+{
+  if (b > c)
+  {                          // if the range spans midnight
     return a >= b || a <= c; // return true if a is greater or equal to b or less than or equal to c
-  } else {
+  }
+  else
+  {
     return a >= b && a <= c; // otherwise, return true if a is greater or equal to b and less than or equal to c
   }
 }
@@ -428,7 +523,7 @@ void updateDisplay(void)
   // Determine if clock should be on or off
   // Clock is on between these hours
 
-  if (!(isHourInRange(hour(localTime),CLOCK_OFF_FROM_HOUR,CLOCK_OFF_TO_HOUR)) || ALWAYS_ON)
+  if (!(isHourInRange(hour(localTime), clockOffHourFrom, clockOffHourTo)) || alwaysOn)
   {
     if (!clockOn)
     {
@@ -450,7 +545,7 @@ void updateDisplay(void)
 
     if (showingOffset)
     {
-      write_time_offset(); // write offset to NVS on display
+      write_time_offset_NVS(); // write offset to NVS on display
       showTimeOffset();
       showingOffset = false;
       clockOn = true;
@@ -494,12 +589,6 @@ void updateDisplay(void)
     showDate();
     showingDate = false;
   }
-  else if (showingOffset)
-  {
-    write_time_offset(); // write offset to NVS on display
-    showTimeOffset();
-    showingOffset = false;
-  }
   else if (showingTime)
   {
     showTime();
@@ -513,7 +602,7 @@ bool hasWifiBeenConfigured()
 
   if (esp_wifi_get_config(WIFI_IF_STA, &config) != ESP_OK)
     return false;
-  ESP_LOGI(TAG, "SSID: %s, BSSID: " MACSTR, config.sta.ssid, MAC2STR(config.sta.bssid));
+  // ESP_LOGI(TAG, "SSID: %s, BSSID: " MACSTR, config.sta.ssid, MAC2STR(config.sta.bssid));
   return (strlen((const char *)config.sta.ssid) >= 1) || (memcmp(empty_bssid, config.sta.bssid, sizeof(empty_bssid)) != 0);
 }
 
@@ -634,6 +723,12 @@ void longModeClickStop(Button2 &btn)
   long microssSinceLast = (micros() - modeStart);
   long secondsSinceLast = microssSinceLast / 1000000;
 
+  if (secondsSinceLast > 5 && secondsSinceLast < 20)
+  {
+    Serial.println("Restarting...");
+    ESP.restart();
+  }
+
   if (secondsSinceLast > 20)
   {
     factoryReset = true;
@@ -717,11 +812,51 @@ void setup()
   lastRunWifiCheck = utcTime;
 
   // Storage retrival of timezone offset from NVS Storage.
-  time_offset = DEFAULT_TIME_OFFSET;
+
   NVS.begin();
+
   int nvsTimeOffset = NVS.getInt("time_offset");
-  Serial.print("nvsTimeOffset: ");
+  Serial.print("time_offset: ");
   Serial.println(nvsTimeOffset);
+
+  int clockOffHourFromM = NVS.getInt("off_hour_from");
+  Serial.print("clock_off_hour_from: ");
+  Serial.println(clockOffHourFromM);
+
+  int clockOffHourToM = NVS.getInt("off_hour_to");
+  Serial.print("clock_off_hour_to: ");
+  Serial.println(clockOffHourToM);
+
+  int alwaysOnM = NVS.getInt("always_on");
+  Serial.print("always_on: ");
+  Serial.println(alwaysOnM);
+
+  if (clockOffHourFromM == 0 || clockOffHourFromM < 400)
+  {
+    Serial.println("off_hour_from not found in NVS, using default");
+  }
+  else
+  {
+    clockOffHourFrom = clockOffHourFromM - 500;
+  }
+
+  if (clockOffHourToM == 0 || clockOffHourToM < 400)
+  {
+    Serial.println("off_hour_to not found in NVS, using default");
+  }
+  else
+  {
+    clockOffHourTo = clockOffHourToM - 500;
+  }
+
+  if (alwaysOnM == 0 || alwaysOnM < 400)
+  {
+    Serial.println("always_on not found in NVS, using default");
+  }
+  else
+  {
+    alwaysOn = alwaysOnM - 500;
+  }
 
   if (nvsTimeOffset == 0 || nvsTimeOffset < 400)
   {
@@ -731,6 +866,8 @@ void setup()
   {
     time_offset = nvsTimeOffset - 500;
   }
+
+  param_time_offset_int.setValue(time_offset);
   Serial.print("time_offset: ");
   Serial.println(time_offset);
 
@@ -761,6 +898,8 @@ void setup()
   //  wifiManager.resetSettings();
 
 #if WIFI_ENABLED
+
+  wifiManager.setSaveParamsCallback(saveParamCallback);
 
   wifiManager.setHostname(HOSTNAME);
   wifiManager.setCountry("US");
@@ -804,26 +943,41 @@ void setup()
   initGPSTime(NIXIE_Interface);
 #endif
 
+  wifiManager.addParameter(&param_time_offset_int);
+  wifiManager.addParameter(&param_clock_off_hour_from);
+  wifiManager.addParameter(&param_clock_off_hour_to);
+
+  wifiManager.addParameter(&param_always_on);
+
 #if PLAY_SOUNDS
   // init the filesystem
-  SPIFFS.begin();
-  Serial.print("Loading melody from file... ");
-  Melody melody = MelodyFactory.loadRtttlFile(melodyFilePath);
-  if (!melody)
+
+  Serial.println("Mounting file system");
+
+  if (SPIFFS.begin())
   {
-    Serial.println("Error");
+
+    Serial.print("Loading melody from file... ");
+    Melody melody = MelodyFactory.loadRtttlFile(melodyFilePath);
+    if (!melody)
+    {
+      Serial.println("Error");
+    }
+    else
+    {
+      Serial.println("Done!");
+
+      Serial.print("Playing ");
+      Serial.print(melody.getTitle());
+      Serial.print("... ");
+      player.play(melody);
+      Serial.println("Done!");
+    }
   }
   else
   {
-    Serial.println("Done!");
-
-    Serial.print("Playing ");
-    Serial.print(melody.getTitle());
-    Serial.print("... ");
-    player.play(melody);
-    Serial.println("Done!");
+    Serial.println("failed to mount FS");
   }
-
 #endif
 
   // Do the anti poisoning routine
@@ -848,6 +1002,7 @@ void loop()
     factoryReset = false;
     wifiManager.resetSettings();
     NVS.eraseAll();
+    SPIFFS.format();
     Serial.print("It's called Daisy. Daisy, Daisy, give me your answer do. I'm half crazy all for the love of you... ");
     ESP.restart();
     return;
